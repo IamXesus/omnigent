@@ -1322,7 +1322,10 @@ def register_core_routes(
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
                     _logger.warning("session-updates stream task crashed: %r", exc)
         finally:
-            with contextlib.suppress(RuntimeError):
+            # The peer may already be gone when a reader/ticker task detects
+            # the disconnect. Closing that dead socket is best-effort and
+            # must not surface as an ASGI application error.
+            with contextlib.suppress(RuntimeError, WebSocketDisconnect, OSError):
                 await websocket.close()
 
     # ── Codex-native goal controls ───────────────────────────────

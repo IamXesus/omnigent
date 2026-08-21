@@ -30,9 +30,8 @@ import {
 
 /**
  * Backoff schedule for automatic re-attach after a transport-level
- * close ({@link isUnexpectedTerminalClose}). One entry per attempt;
- * when the schedule is exhausted the closed overlay stays up and the
- * user falls back to a manual refresh / resume.
+ * close ({@link isUnexpectedTerminalClose}). After the final entry the
+ * client keeps retrying at the capped delay until the bridge recovers.
  *
  * Exported for direct unit testing (fake timers advance through it).
  */
@@ -271,12 +270,14 @@ export function TerminalView({
       reconnectAttemptsRef.current = 0;
     }
     connectedAtRef.current = null;
-    if (reconnectAttemptsRef.current >= RECONNECT_BACKOFF_MS.length) {
-      setReconnectPending(false);
-      return;
-    }
-    const delay = RECONNECT_BACKOFF_MS[reconnectAttemptsRef.current];
-    reconnectAttemptsRef.current += 1;
+    const attemptIndex = Math.min(reconnectAttemptsRef.current, RECONNECT_BACKOFF_MS.length - 1);
+    const delay = RECONNECT_BACKOFF_MS[attemptIndex];
+    // Cap the counter with the delay. A long outage keeps retrying every
+    // 8 seconds instead of stranding the terminal until a page refresh.
+    reconnectAttemptsRef.current = Math.min(
+      reconnectAttemptsRef.current + 1,
+      RECONNECT_BACKOFF_MS.length,
+    );
     setReconnectPending(true);
     // Re-dial on whichever fires first: the backoff timer (visible
     // tabs), or the tab becoming visible again — frozen background

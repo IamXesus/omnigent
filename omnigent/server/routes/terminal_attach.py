@@ -410,6 +410,10 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
                     await browser_ws.send_bytes(bytes(msg))
                 else:
                     await browser_ws.send_text(msg)
+        except (WebSocketDisconnect, OSError):
+            # The browser can disappear between the runner recv and the
+            # browser send. Treat that race as a normal client departure.
+            return
         except ConnectionClosed as cc:
             # Surface the runner-side close code so the browser
             # mirrors it (4404 for missing terminal, etc.). Use
