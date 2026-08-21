@@ -559,8 +559,7 @@ describe("automatic reconnect", () => {
 
   it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
     // A warm surface parked behind another session's view: the transport
-    // flaps with nobody watching and the background reconnect loop burns
-    // its whole budget.
+    // flaps with nobody watching and reaches the capped retry delay.
     const { rerender } = render(
       <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
     );
@@ -573,15 +572,30 @@ describe("automatic reconnect", () => {
       await elapse(delay);
     }
     closeNewest(1006);
-    await elapse(60_000);
-    const exhausted = RECONNECT_BACKOFF_MS.length + 1;
-    expect(terminalSessionMock.instances).toHaveLength(exhausted);
+    await elapse(RECONNECT_BACKOFF_MS.at(-1)!);
+    const backgroundRetried = terminalSessionMock.instances.length;
+    expect(backgroundRetried).toBe(RECONNECT_BACKOFF_MS.length + 2);
+
+    // Drop the capped background retry, but reveal the surface before its
+    // next 8 s timer fires.
+    closeNewest(1006);
 
     // Reveal: a user is now looking at the dead pane — that is the retry
     // signal, same as a tab thaw. One fresh dial, budget restored.
     rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
     await act(async () => {});
-    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+    expect(terminalSessionMock.instances).toHaveLength(backgroundRetried + 1);
+
+    // The stale capped timer was cancelled by the immediate reveal re-dial.
+    await elapse(RECONNECT_BACKOFF_MS.at(-1)!);
+    expect(terminalSessionMock.instances).toHaveLength(backgroundRetried + 1);
+
+    // A subsequent drop starts again at the first 500 ms backoff step.
+    closeNewest(1006);
+    await elapse(RECONNECT_BACKOFF_MS[0] - 1);
+    expect(terminalSessionMock.instances).toHaveLength(backgroundRetried + 1);
+    await elapse(1);
+    expect(terminalSessionMock.instances).toHaveLength(backgroundRetried + 2);
   });
 
   it("does not resurrect a deliberately closed terminal on reveal", async () => {
