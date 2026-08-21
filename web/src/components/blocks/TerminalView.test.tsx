@@ -470,7 +470,7 @@ describe("automatic reconnect", () => {
     expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
   });
 
-  it("stops re-dialing once the retry budget is exhausted", async () => {
+  it("keeps re-dialing at the capped delay after the initial backoff steps", async () => {
     await renderAndAttach();
 
     // Each close→backoff cycle burns one budget entry. The re-dialed
@@ -486,13 +486,14 @@ describe("automatic reconnect", () => {
       expect(terminalSessionMock.instances).toHaveLength(attempt + 2);
     }
 
+    // Further transport drops keep retrying at the final (8 s) delay.
+    // This covers outages longer than the initial 15.5 s schedule.
     closeNewest(1006);
-    await elapse(60_000);
-    // Budget exhausted: the final close sticks as the dead-end overlay
-    // and no further sessions are constructed.
+    expect(screen.getByTestId("terminal-reconnecting")).toBeInTheDocument();
+    await elapse(RECONNECT_BACKOFF_MS.at(-1)! - 1);
     expect(terminalSessionMock.instances).toHaveLength(RECONNECT_BACKOFF_MS.length + 1);
-    expect(screen.getByText("Bridge closed: code 1006")).toBeInTheDocument();
-    expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
+    await elapse(1);
+    expect(terminalSessionMock.instances).toHaveLength(RECONNECT_BACKOFF_MS.length + 2);
   });
 
   it("restores the retry budget after a connection that stayed up past the stability window", async () => {

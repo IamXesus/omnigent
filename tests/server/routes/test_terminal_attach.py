@@ -41,7 +41,10 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
-from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.terminal_attach import (
+    _shuttle_ws_frames,
+    create_terminal_attach_router,
+)
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -333,6 +336,28 @@ class _FakeRunnerWSFactory:
                 return None
 
         return _CM(self._conn)
+
+
+@pytest.mark.parametrize("disconnect", [WebSocketDisconnect(code=1006), OSError("gone")])
+async def test_runner_to_browser_disconnect_is_a_normal_terminal_condition(
+    disconnect: Exception,
+) -> None:
+    """A browser disappearing during a runner send must end the shuttle cleanly."""
+
+    class _GoneBrowser:
+        async def receive(self) -> dict[str, str]:
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        async def send_bytes(self, _data: bytes) -> None:
+            raise disconnect
+
+        async def send_text(self, _data: str) -> None:
+            raise disconnect
+
+    runner = _FakeRunnerWSConn(outgoing=[b"late output"])
+
+    await asyncio.wait_for(_shuttle_ws_frames(_GoneBrowser(), runner), timeout=1.0)  # type: ignore[arg-type]
 
 
 async def test_attach_terminal_rejects_unauthorized_user_before_runner_proxy() -> None:
