@@ -2414,6 +2414,7 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 @pytest.mark.asyncio
 async def test_required_terminal_clean_quit_publishes_idle_not_failed(
     terminal_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A clean ``/quit`` of qwen/antigravity-native is not a crash.
 
@@ -2436,6 +2437,16 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
     )
 
     conv_id = uuid.uuid4().hex
+    teardown_calls: list[str] = []
+
+    async def _fake_teardown(session_id: str) -> None:
+        teardown_calls.append(session_id)
+
+    monkeypatch.setattr(
+        runner_app._native_runtime,
+        "teardown_codex_native_app_server",
+        _fake_teardown,
+    )
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     pm._sessions.add(conv_id)
     app = create_runner_app(
@@ -2466,7 +2477,7 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
             queued_events.extend(
                 _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
             )
-            if pm.released:
+            if pm.released and teardown_calls:
                 break
             await asyncio.sleep(0)
     finally:
@@ -2489,6 +2500,7 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
     ] == []
     # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
+    assert teardown_calls == [conv_id]
 
 
 @pytest.mark.asyncio

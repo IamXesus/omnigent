@@ -161,6 +161,64 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
         )
 
 
+async def teardown_codex_native_app_server(session_id: str) -> None:
+    """
+    Tear down a host-spawned codex-native session's app-server subprocess.
+
+    Only the ``DELETE /v1/sessions`` teardown runs the full native cleanup;
+    the codex TUI pane can also disappear on its own — the idle pane reaper
+    closes the tmux pane after the idle window, and an unexpected TUI exit
+    (crash / OOM / host recycle) evicts it — neither of which cancels the
+    forwarder. Left alone, the per-session ``codex app-server`` (and its
+    forwarder) survives with no TUI, so long-lived multi-session runners
+    (e.g. Polly, which dispatches every ``codex`` sub-agent this way)
+    accumulate orphaned ``codex`` processes.
+
+    Cancelling the forwarder closes the app-server via the forwarder's own
+    ``finally`` (see :func:`_codex_discover_thread_and_forward`); the pop
+    below is the belt-and-suspenders close for the discovery-failed case
+    where no forwarder ever adopted the server. No-op for a session that
+    has no registered codex app-server, so this is safe to call from the
+    shared pane-teardown paths regardless of harness.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+    if session_id not in _AUTO_CODEX_APP_SERVERS:
+        return
+    await _cancel_auto_forwarder_task(session_id)
+    leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    if leftover_app_server is not None:
+        with contextlib.suppress(Exception):
+            await leftover_app_server.close()
+
+
+async def teardown_all_codex_native_app_servers() -> None:
+    """
+    Tear down every host-spawned codex-native app-server on this runner.
+
+    Called from the runner's shutdown path (``_stop_pm``) so a graceful host
+    or runner stop — the host SIGTERMs its runners on ``host.stop_runner`` and
+    on its own exit — takes the per-session ``codex app-server`` subprocesses
+    down with it. Each app-server is spawned ``start_new_session=True`` (its
+    own process group), so it is NOT killed by the runner's death; without an
+    explicit close here it is reparented to init and lingers as an orphaned
+    ``codex`` process. Per-session teardown normally runs on
+    ``DELETE /v1/sessions``, but a host stop tears the runner down without
+    deleting each session first, so those never fire.
+
+    Iterates a snapshot of the registered session ids and delegates to
+    :func:`teardown_codex_native_app_server` (which cancels the forwarder and
+    closes the server). Best-effort and idempotent: a session already torn
+    down is a no-op.
+
+    :returns: None.
+    """
+    for session_id in list(_AUTO_CODEX_APP_SERVERS):
+        with contextlib.suppress(Exception):
+            await teardown_codex_native_app_server(session_id)
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
@@ -3659,24 +3717,33 @@ async def _auto_create_codex_terminal(
             # connect() may have half-opened the ws before the initialize
             # handshake failed, so close the listener too — not just the
             # app-server.
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             with contextlib.suppress(Exception):
                 await event_client.close()
-            await app_server.close()
-            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            with contextlib.suppress(Exception):
+                await app_server.close()
             raise
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(codex_ws_url, launch_config.external_session_id)
-        write_bridge_state(
-            bridge_dir,
-            CodexNativeBridgeState(
-                session_id=session_id,
-                socket_path=codex_ws_url,
-                thread_id=launch_config.external_session_id,
-                codex_home=str(codex_home),
-            ),
-        )
+        try:
+            await preload_codex_thread_for_resume(codex_ws_url, launch_config.external_session_id)
+            write_bridge_state(
+                bridge_dir,
+                CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path=codex_ws_url,
+                    thread_id=launch_config.external_session_id,
+                    codex_home=str(codex_home),
+                ),
+            )
+        except Exception:
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            with contextlib.suppress(Exception):
+                await event_client.close()
+            with contextlib.suppress(Exception):
+                await app_server.close()
+            raise
 
     # Register the Codex TUI as a streamable terminal resource attached to
     # the app-server started above (``--remote`` over its loopback ws
@@ -3747,9 +3814,11 @@ async def _auto_create_codex_terminal(
             },
         )
     except Exception:
-        await event_client.close()
-        await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await event_client.close()
+        with contextlib.suppress(Exception):
+            await app_server.close()
         raise
 
     # Adopt the thread the fresh TUI creates and run the forwarder in the

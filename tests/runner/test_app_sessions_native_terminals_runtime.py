@@ -420,6 +420,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
             self.started = False
+            self.close_calls = 0
             # Provider/model -c overrides the runner forwards to the
             # --remote TUI; empty here (no profile in this test).
             self.config_overrides: list[str] = []
@@ -434,6 +435,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         async def close(self) -> None:
             """:returns: None."""
+            self.close_calls += 1
+            if fail_closes:
+                raise RuntimeError("app-server close failed")
 
     app_server = _FakeCodexAppServer()
     build_calls: list[dict[str, Any]] = []
@@ -448,6 +452,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         build_calls.append(kwargs)
         app_server.codex_home = kwargs["codex_home"]
         return app_server
+
+    discovery_close_calls = 0
 
     class _UnexpectedDiscoveryClient:
         """
@@ -476,6 +482,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         async def close(self) -> None:
             """:returns: None."""
+            nonlocal discovery_close_calls
+            discovery_close_calls += 1
+            if fail_closes:
+                raise RuntimeError("event client close failed")
 
     launched_specs: list[Any] = []
 
@@ -517,6 +527,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
+    fail_preload_once = True
+    fail_closes = True
 
     async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
         """
@@ -530,7 +542,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
         )
+        nonlocal fail_preload_once
         preload_calls.append((transport, loaded_thread_id))
+        if fail_preload_once:
+            fail_preload_once = False
+            raise RuntimeError("active writer already owns thread")
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -559,6 +575,23 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         ),
     )
 
+    with pytest.raises(RuntimeError, match="active writer already owns thread"):
+        await _auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, event: published_events.append(event),
+            agent_spec=agent_spec,
+            server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        )
+
+    assert app_server.close_calls == 1
+    assert discovery_close_calls == 1
+    assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+    assert codex_native_bridge.read_bridge_state(bridge_dir) is None
+    assert launched_specs == []
+    assert published_events == []
+
+    fail_closes = False
     try:
         terminal_view = await _auto_create_codex_terminal(
             session_id,
@@ -596,7 +629,12 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
-    assert preload_calls == [(app_server.listen_url, thread_id)]
+    assert [loaded_thread_id for _transport, loaded_thread_id in preload_calls] == [
+        thread_id,
+        thread_id,
+    ]
+    assert preload_calls[0][0] != preload_calls[1][0]
+    assert preload_calls[1][0] == app_server.listen_url
     assert published_events[0]["type"] == "session.resource.created"
     assert forward_calls == [
         {

@@ -27,6 +27,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.pane_reaper import PaneRef
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -59,6 +60,70 @@ class _EnsureTerminalCase:
     expect_auto_create: bool
     expect_launch: bool
     expect_name: str
+
+
+@pytest.mark.asyncio
+async def test_native_pane_reaper_tears_down_codex_server_when_pane_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle-pane cleanup always reaches the codex app-server teardown hook."""
+    from omnigent.runner import app as runner_app_mod
+
+    session_id = "7777777788888888aaaaaaaabbbbbbbb"
+    socket_path = tmp_path / "codex.sock"
+    close_calls: list[tuple[str, str]] = []
+    teardown_calls: list[str] = []
+
+    monkeypatch.setattr(
+        TerminalRegistry,
+        "native_panes",
+        lambda _self: [(session_id, "codex", socket_path)],
+    )
+    monkeypatch.setattr(
+        SessionResourceRegistry,
+        "terminal_resource_role",
+        lambda _self, _session_id, _terminal_id: CODEX_NATIVE_TERMINAL_ROLE,
+    )
+
+    async def _fail_close(
+        _self: SessionResourceRegistry,
+        close_session_id: str,
+        terminal_id: str,
+    ) -> bool:
+        close_calls.append((close_session_id, terminal_id))
+        raise RuntimeError("pane close failed")
+
+    async def _fake_teardown(teardown_session_id: str) -> None:
+        teardown_calls.append(teardown_session_id)
+
+    monkeypatch.setattr(SessionResourceRegistry, "close_terminal", _fail_close)
+    monkeypatch.setattr(
+        runner_app_mod._native_runtime,
+        "teardown_codex_native_app_server",
+        _fake_teardown,
+    )
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    pane = reaper._list_native_panes()[0]
+    assert pane == PaneRef(
+        session_id,
+        terminal_resource_id("codex", "main"),
+        "codex",
+        socket_path,
+    )
+
+    with pytest.raises(RuntimeError, match="pane close failed"):
+        await reaper._reap(pane)
+
+    assert close_calls == [(session_id, terminal_resource_id("codex", "main"))]
+    assert teardown_calls == [session_id]
 
 
 @pytest.mark.parametrize(

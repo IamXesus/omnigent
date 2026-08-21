@@ -1398,6 +1398,8 @@ async def test_runner_shutdown_closes_terminal_registry(
     mcp_managers: list[_TrackingMcpManager] = []
     async_clients: list[_TrackingAsyncClient] = []
     sync_clients: list[_TrackingSyncClient] = []
+    reconcile_calls = 0
+    teardown_all_calls = 0
 
     class _FakeProcessManager:
         def __init__(self) -> None:
@@ -1438,6 +1440,14 @@ async def test_runner_shutdown_closes_terminal_registry(
         sync_clients.append(client)
         return client
 
+    def _reconcile_process_registry() -> None:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+
+    async def _teardown_all_app_servers() -> None:
+        nonlocal teardown_all_calls
+        teardown_all_calls += 1
+
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
     monkeypatch.setattr(
         "omnigent.runtime.harnesses.process_manager.HarnessProcessManager",
@@ -1451,6 +1461,14 @@ async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch.setattr(entry_mod.httpx, "Client", _sync_client_factory)
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
     monkeypatch.setattr(
+        "omnigent.codex_native_process_registry.reconcile_codex_native_process_registry",
+        _reconcile_process_registry,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.teardown_all_codex_native_app_servers",
+        _teardown_all_app_servers,
+    )
+    monkeypatch.setattr(
         "omnigent.runner.identity.get_stable_runner_id",
         lambda: "runner-test-id",
     )
@@ -1461,6 +1479,8 @@ async def test_runner_shutdown_closes_terminal_registry(
         pass
 
     assert process_managers and process_managers[0].shutdown_called
+    assert reconcile_calls == 1
+    assert teardown_all_calls == 1
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
