@@ -321,6 +321,32 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertIn("assistant: two", prompt)
         self.assertIn("user: three", prompt)
 
+    def test_build_initial_prompt_keeps_history_images_out_of_text(self):
+        image_url = "data:image/png;base64," + ("A" * 1_100_000)
+        prompt = _build_initial_prompt(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect this"},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                },
+                {"role": "assistant", "content": "Working on it."},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        self.assertIsInstance(prompt, list)
+        turn_input = _to_codex_input_items(prompt)
+        text_items = [item for item in turn_input if item["type"] == "text"]
+        image_items = [item for item in turn_input if item["type"] == "image"]
+        self.assertEqual(len(text_items), 1)
+        self.assertIn("user: inspect this\n[image attachment 1]", text_items[0]["text"])
+        self.assertIn("user: continue", text_items[0]["text"])
+        self.assertNotIn(image_url, text_items[0]["text"])
+        self.assertEqual(image_items, [{"type": "image", "url": image_url}])
+
     def test_dynamic_tool_result_payload_uses_content_items(self):
         payload = _dynamic_tool_result_payload({"answer": 5})
         self.assertEqual(payload["success"], True)

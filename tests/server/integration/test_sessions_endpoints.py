@@ -30,7 +30,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, create_test_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -129,6 +129,24 @@ async def test_create_session_with_title_and_labels(
     assert session["title"] == "my test session"
     assert session["labels"]["env"] == "test"
     assert session["labels"]["priority"] == "high"
+
+
+async def test_bundled_codex_native_session_gets_wrapper_labels(
+    client: httpx.AsyncClient,
+) -> None:
+    """A custom Codex native bundle exposes native Web UI controls."""
+    session = await create_test_session(
+        client,
+        name="custom-codex-orchestrator",
+        labels={"team": "platform"},
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+
+    assert session["labels"] == {
+        "team": "platform",
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": "codex-native-ui",
+    }
 
 
 async def test_create_session_without_title_returns_none(
