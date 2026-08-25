@@ -155,6 +155,29 @@ async def test_bundled_codex_native_session_gets_wrapper_labels(
     }
 
 
+async def test_registered_custom_codex_native_session_keeps_wrapper_labels(
+    client: httpx.AsyncClient,
+) -> None:
+    """A later session from an uploaded Codex agent keeps native UI controls."""
+    registered = await create_test_session(
+        client,
+        name="registered-codex-orchestrator",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+
+    session = await _create_session(
+        client,
+        registered["agent_id"],
+        labels={"team": "platform"},
+    )
+
+    assert session["labels"] == {
+        "team": "platform",
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": "codex-native-ui",
+    }
+
+
 async def test_create_session_without_title_returns_none(
     client: httpx.AsyncClient,
 ) -> None:

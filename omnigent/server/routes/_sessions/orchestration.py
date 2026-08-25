@@ -250,6 +250,7 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
+    _presentation_labels_for_agent,
     _persist_native_policy_notice,
     _persist_session_status_error_labels,
     _persist_stored_session_bundle,
@@ -8111,6 +8112,24 @@ async def _create_session_from_existing_agent(
         # premature (routing may pick a non-native SDK harness).
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_sa_labels)
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
+        conv.labels.update(_merged)
+    elif (
+        body.sub_agent_name is None
+        and harness_override is None
+        and (
+            _custom_native_labels := await asyncio.to_thread(
+                _presentation_labels_for_agent, agent
+            )
+        )
+    ):
+        # A previously uploaded custom native agent is created through the
+        # registered-agent JSON path on subsequent sessions. Its name is not a
+        # built-in wrapper name, so resolve the persisted bundle's harness and
+        # restore the same terminal/model/effort presentation labels that the
+        # original multipart upload received.
+        _merged = dict(body.labels) if body.labels else {}
+        _merged.update(_custom_native_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
         conv.labels.update(_merged)
     elif (
