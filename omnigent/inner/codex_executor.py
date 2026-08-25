@@ -1861,8 +1861,8 @@ def _build_initial_prompt(
 
     For single-message or single-user-message inputs, returns
     the latest user content directly (may be multimodal). For
-    multi-turn history, serializes prior turns as text and
-    returns a plain string.
+    multi-turn history, serializes prior turns as text while
+    preserving attachments as structured content blocks.
 
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
@@ -1872,6 +1872,7 @@ def _build_initial_prompt(
         return _extract_latest_user_content(messages)
 
     lines = ["Conversation so far:"]
+    attachments: list[dict[str, Any]] = []
     for msg in messages:
         role = str(msg.get("role", "user")).replace("_", " ")
         raw_content = msg.get("content")
@@ -1879,12 +1880,33 @@ def _build_initial_prompt(
             content = ""
         elif isinstance(raw_content, str):
             content = raw_content
+        elif isinstance(raw_content, list):
+            content_parts: list[str] = []
+            for block in raw_content:
+                if not isinstance(block, dict):
+                    content_parts.append(json.dumps(block, ensure_ascii=True))
+                    continue
+                block_type = block.get("type")
+                if block_type in ("input_text", "output_text", "text"):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        content_parts.append(text)
+                elif block_type in ("input_image", "input_file"):
+                    attachments.append(block)
+                    kind = "image" if block_type == "input_image" else "file"
+                    content_parts.append(f"[{kind} attachment {len(attachments)}]")
+                else:
+                    content_parts.append(json.dumps(block, ensure_ascii=True))
+            content = "\n".join(content_parts)
         else:
             content = json.dumps(raw_content, ensure_ascii=True)
         lines.append(f"{role}: {content}")
     lines.append("")
     lines.append("Respond to the latest user message, using the conversation above as context.")
-    return "\n".join(lines)
+    transcript = "\n".join(lines)
+    if not attachments:
+        return transcript
+    return [{"type": "input_text", "text": transcript}, *attachments]
 
 
 def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:

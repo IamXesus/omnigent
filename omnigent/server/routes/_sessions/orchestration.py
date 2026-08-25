@@ -8376,6 +8376,14 @@ def _create_session_from_bundle(
     )
     assert spec.name is not None
 
+    # Custom bundles bypass the named-agent path, so derive native Web UI
+    # labels from the validated harness. Server-derived values win.
+    presentation_labels = _native_subagent_wrapper_labels_from_spec(spec)
+    if presentation_labels:
+        metadata = metadata.model_copy(
+            update={"labels": {**metadata.labels, **presentation_labels}}
+        )
+
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
     try:
