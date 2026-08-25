@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
@@ -49,6 +51,7 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.inner import _proc
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -60,6 +63,7 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+_REAL_POPEN = subprocess.Popen
 
 
 async def test_handle_model_options_uses_host_claude_configuration(
@@ -127,6 +131,36 @@ def _cleanup_host(host: HostProcess) -> None:
     host._cleanup_runners()
     for task in host._watcher_tasks:
         task.cancel()
+    for task in host._termination_tasks:
+        task.cancel()
+
+
+def _spawn_sleeping_process_tree(
+    tmp_path: Path,
+    name: str,
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Spawn a long-lived parent and child, returning both process identities."""
+    child_pid_path = tmp_path / f"{name}-child.pid"
+    parent_script = (
+        "import pathlib, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "time.sleep(60)"
+    )
+    parent = _REAL_POPEN(
+        [sys.executable, "-c", parent_script, str(child_pid_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 5.0
+    while not child_pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not child_pid_path.exists():
+        parent.kill()
+        parent.wait(timeout=5.0)
+        raise AssertionError("runner stand-in did not start its child")
+    return parent, int(child_pid_path.read_text(encoding="utf-8"))
 
 
 async def test_handle_launch_spawns_subprocess(
@@ -205,6 +239,118 @@ async def test_handle_launch_spawns_subprocess(
 
     # Clean up the spawned sleep process (and its exit watcher).
     _cleanup_host(host)
+
+
+@pytest.mark.parametrize("second_token", ["tok_second", "tok_first"])
+async def test_handle_launch_replaces_existing_runner_for_same_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_token: str,
+) -> None:
+    """A session retry must replace its runner, including same-token delivery."""
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    first = HostLaunchRunnerFrame(
+        request_id="req_first",
+        binding_token="tok_first",
+        workspace=str(workspace),
+        session_id="session_same",
+    )
+    second = HostLaunchRunnerFrame(
+        request_id="req_second",
+        binding_token=second_token,
+        workspace=str(workspace),
+        session_id="session_same",
+    )
+    other_session = HostLaunchRunnerFrame(
+        request_id="req_other",
+        binding_token="tok_other",
+        workspace=str(workspace),
+        session_id="session_other",
+    )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first_result = await host._handle_launch(first)
+        first_handle = host._runners[first_result.runner_id or ""]
+        first_watcher = next(iter(host._watcher_tasks))
+        second_result = await host._handle_launch(second)
+        second_handle = host._runners[second_result.runner_id or ""]
+        other_result = await host._handle_launch(other_session)
+
+    try:
+        await asyncio.wait_for(first_watcher, timeout=5.0)
+        await asyncio.wait_for(
+            asyncio.gather(*host._termination_tasks),
+            timeout=5.0,
+        )
+        assert first_handle.proc.poll() is not None
+        assert second_handle.proc.poll() is None
+        assert set(host._runners) == {second_result.runner_id, other_result.runner_id}
+        assert tunnel.sent == []
+        assert host._unreported_exits == {}
+    finally:
+        _cleanup_host(host)
+
+
+async def test_handle_launch_spawn_failure_preserves_existing_session_runner(
+    tmp_path: Path,
+) -> None:
+    """A failed replacement spawn must leave the current runner untouched."""
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+
+    def _live_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    first = HostLaunchRunnerFrame(
+        request_id="req_existing",
+        binding_token="tok_existing",
+        workspace=str(workspace),
+        session_id="session_preserved",
+    )
+    replacement = HostLaunchRunnerFrame(
+        request_id="req_failed",
+        binding_token="tok_failed",
+        workspace=str(workspace),
+        session_id="session_preserved",
+    )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_live_popen):
+        first_result = await host._handle_launch(first)
+    first_handle = host._runners[first_result.runner_id or ""]
+    with patch(
+        "omnigent.host.connect.subprocess.Popen",
+        side_effect=OSError("spawn failed"),
+    ):
+        failed_result = await host._handle_launch(replacement)
+
+    try:
+        assert failed_result.status == "failed"
+        assert first_handle.proc.poll() is None
+        assert host._runners == {first_result.runner_id: first_handle}
+    finally:
+        _cleanup_host(host)
 
 
 async def test_handle_launch_fails_for_bad_workspace() -> None:
@@ -935,6 +1081,37 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert "runner_aaa" not in host._runners
 
 
+async def test_handle_stop_terminates_runner_descendants(tmp_path: Path) -> None:
+    """Stopping a session must not leave its runner's child processes alive."""
+    host = _make_host_process()
+    proc, child_pid = _spawn_sleeping_process_tree(tmp_path, "stopped-runner")
+    child = psutil.Process(child_pid)
+    host._runners["runner_tree"] = _RunnerHandle(
+        proc=proc,
+        log_path=tmp_path / "runner-tree.log",
+    )
+
+    try:
+        result = host._handle_stop(
+            HostStopRunnerFrame(request_id="req_tree", runner_id="runner_tree")
+        )
+        assert result.status == "stopped"
+        assert proc.poll() is not None
+        deadline = time.monotonic() + 3.0
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert not _proc.process_alive(child_pid), "runner child survived session stop"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        try:
+            child.kill()
+            child.wait(timeout=5.0)
+        except psutil.NoSuchProcess:
+            pass
+
+
 def test_handle_stop_unknown_runner() -> None:
     """
     Verify that _handle_stop returns status='failed' for an
@@ -1065,7 +1242,7 @@ def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
     alive_proc.wait()
 
 
-def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
+async def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     """
     Verify that _cleanup_runners terminates every tracked runner.
 
@@ -1073,10 +1250,10 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     If any runner survives, the host leaves orphaned processes.
     """
     host = _make_host_process()
-    procs = []
+    procs: list[subprocess.Popen[bytes]] = []
     for name in ("runner_a", "runner_b", "runner_c"):
         proc = subprocess.Popen(
-            ["sleep", "60"],
+            [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1162,6 +1339,27 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
 
     runner.wait()
+
+
+async def test_runner_handle_lookup_includes_runner_terminating_in_background(
+    tmp_path: Path,
+) -> None:
+    """The waitpid fallback must preserve Popen ownership during replacement."""
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    handle = _RunnerHandle(proc=proc, log_path=tmp_path / "terminating.log")
+    host._terminating_runners[proc.pid] = handle
+
+    try:
+        assert host._runner_handle_for_pid(proc.pid) is handle
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5.0)
+        host._terminating_runners.clear()
 
 
 def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -202,6 +203,41 @@ def test_terminate_tree_stops_the_process() -> None:
     # A reaped PID raises NoSuchProcess, which also means it isn't running.
     with contextlib.suppress(psutil.NoSuchProcess):
         assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
+
+
+@pytest.mark.posix_only
+def test_terminate_tree_kills_sigterm_resistant_detached_descendant(tmp_path: Path) -> None:
+    """Grace expiry kills a detached descendant even after its leader exits."""
+    child_pid_path = tmp_path / "stubborn-child.pid"
+    parent_script = (
+        "import subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', "
+        '"import os, pathlib, signal, sys, time; '
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)", '
+        "sys.argv[1]], start_new_session=True); "
+        "time.sleep(60)"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_script, str(child_pid_path)],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5.0
+    while not child_pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert child_pid_path.exists(), "child did not advertise SIGTERM readiness"
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+    try:
+        _proc.terminate_tree(parent, grace=0.2)
+        parent.wait(timeout=5.0)
+        assert not _proc.process_alive(child_pid), "SIGTERM-resistant child survived escalation"
+    finally:
+        _proc.kill_tree(parent)
+        with contextlib.suppress(psutil.NoSuchProcess):
+            child = psutil.Process(child_pid)
+            child.kill()
+            child.wait(timeout=5.0)
 
 
 # --------------------------------------------------------------------------

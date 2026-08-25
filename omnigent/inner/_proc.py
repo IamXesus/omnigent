@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from contextlib import suppress
 from typing import Protocol
 
@@ -125,10 +126,11 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     Gracefully stop ``process`` and all of its descendants.
 
     Sends ``SIGTERM`` (POSIX) / ``terminate()`` (Windows ``TerminateProcess``)
-    to the whole tree. On POSIX the process-group fast path is tried first;
-    otherwise (and on Windows) the tree is walked with :mod:`psutil`. Already
-    exited processes are no-ops. All "process gone / not permitted" errors are
-    swallowed — teardown is best-effort.
+    to a snapshot of the whole tree. On POSIX the process-group fast path is
+    also used, while the explicit snapshot covers descendants that created
+    their own sessions. When ``grace`` is positive, survivors are killed after
+    the deadline. Already exited processes are no-ops. All "process gone / not
+    permitted" errors are swallowed — teardown is best-effort.
 
     :param process: A ``Popen``/``asyncio`` process handle, or ``None``.
     :param grace: Optional seconds to wait for the tree to exit after signaling.
@@ -141,20 +143,22 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
             process.terminate()
         return
 
-    if _killpg(pid, signal.SIGTERM):
-        if grace:
-            _wait_gone(pid, grace)
-        return
-
     procs = _walk_descendants(pid)
-    for proc in procs:
+    group_signalled = _killpg(pid, signal.SIGTERM)
+    for proc in reversed(procs):
+        if group_signalled and proc.pid == pid:
+            continue
         with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.terminate()
     if not procs:
         with suppress(Exception):
             process.terminate()
     if grace:
-        _wait_gone(pid, grace)
+        survivors = _wait_alive(procs, grace)
+        for proc in survivors:
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                proc.kill()
+        _wait_alive(survivors, min(grace, 1.0))
 
 
 def kill_tree(process: _ProcessLike | None) -> None:
@@ -185,9 +189,26 @@ def kill_tree(process: _ProcessLike | None) -> None:
             process.kill()
 
 
-def _wait_gone(pid: int, timeout: float) -> None:
-    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-        psutil.Process(pid).wait(timeout=timeout)
+def _wait_alive(procs: list[psutil.Process], timeout: float) -> list[psutil.Process]:
+    """Return tree members still alive after a bounded non-reaping wait."""
+    deadline = time.monotonic() + timeout
+    alive = _alive_processes(procs)
+    while alive and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        alive = _alive_processes(alive)
+    return alive
+
+
+def _alive_processes(procs: list[psutil.Process]) -> list[psutil.Process]:
+    """Filter live non-zombie processes without consuming child exit status."""
+    alive: list[psutil.Process] = []
+    for proc in procs:
+        try:
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                alive.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return alive
 
 
 def process_alive(pid: int) -> bool:

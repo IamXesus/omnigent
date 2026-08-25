@@ -70,6 +70,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -666,10 +667,13 @@ class _RunnerHandle:
         ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
+    :param session_id: Session this dedicated runner serves. ``None`` for
+        older callers that did not supply a session binding.
     """
 
     proc: subprocess.Popen[bytes]
     log_path: Path
+    session_id: str | None = None
 
 
 class HostProcess:
@@ -718,6 +722,10 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        # Runners superseded by a successful relaunch are removed from
+        # ``_runners`` immediately, then reaped outside the event loop.
+        self._terminating_runners: dict[int, _RunnerHandle] = {}
+        self._termination_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
@@ -742,7 +750,10 @@ class HostProcess:
 
         :returns: Set of live tracked runner OS pids.
         """
-        return {h.proc.pid for h in self._runners.values()}
+        return {
+            *(h.proc.pid for h in self._runners.values()),
+            *self._terminating_runners,
+        }
 
     async def _orphan_reaper_loop(self) -> None:
         """Reap orphaned descendant processes reparented to this host.
@@ -913,7 +924,7 @@ class HostProcess:
         for handle in self._runners.values():
             if handle.proc.pid == pid:
                 return handle
-        return None
+        return self._terminating_runners.get(pid)
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -1188,10 +1199,32 @@ class HostProcess:
                 error=_runner_exit_error(proc.returncode, log_path),
             )
 
-        self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
-        watcher = asyncio.create_task(self._watch_runner(runner_id))
+        superseded_runners = [
+            (existing_runner_id, handle)
+            for existing_runner_id, handle in self._runners.items()
+            if frame.session_id and handle.session_id == frame.session_id
+        ]
+        for existing_runner_id, handle in superseded_runners:
+            if self._runners.get(existing_runner_id) is handle:
+                del self._runners[existing_runner_id]
+
+        new_handle = _RunnerHandle(
+            proc=proc,
+            log_path=log_path,
+            session_id=frame.session_id,
+        )
+        self._runners[runner_id] = new_handle
+        watcher = asyncio.create_task(self._watch_runner(runner_id, new_handle))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
+        for superseded_runner_id, handle in superseded_runners:
+            self._schedule_runner_termination(handle)
+            _logger.info(
+                "Replaced runner %s with %s for session %s",
+                superseded_runner_id,
+                runner_id,
+                frame.session_id,
+            )
         _logger.info(
             "Launched runner %s for workspace %s (pid=%d)",
             runner_id,
@@ -1214,6 +1247,41 @@ class HostProcess:
             runner_id=runner_id,
         )
 
+    def _terminate_runner(self, runner_id: str) -> bool:
+        """Stop and forget one tracked runner without reporting a crash."""
+        handle = self._runners.pop(runner_id, None)
+        if handle is None:
+            return False
+        self._terminate_runner_process(handle)
+        return True
+
+    def _schedule_runner_termination(self, handle: _RunnerHandle) -> None:
+        """Terminate a superseded runner tree without blocking frames."""
+        self._terminating_runners[handle.proc.pid] = handle
+        task = asyncio.create_task(self._finish_runner_termination(handle))
+        self._termination_tasks.add(task)
+        task.add_done_callback(self._termination_tasks.discard)
+
+    async def _finish_runner_termination(self, handle: _RunnerHandle) -> None:
+        """Wait for a signalled runner in a worker thread, killing on timeout."""
+        try:
+            await asyncio.to_thread(self._wait_for_runner_termination, handle)
+        finally:
+            if self._terminating_runners.get(handle.proc.pid) is handle:
+                del self._terminating_runners[handle.proc.pid]
+
+    @staticmethod
+    def _wait_for_runner_termination(handle: _RunnerHandle) -> None:
+        """Terminate and reap one runner together with its captured tree."""
+        HostProcess._terminate_runner_process(handle)
+
+    @staticmethod
+    def _terminate_runner_process(handle: _RunnerHandle) -> None:
+        """Terminate one runner tree and reap its Popen-owned leader."""
+        if handle.proc.poll() is None:
+            _proc.terminate_tree(handle.proc, grace=5.0)
+        handle.proc.wait()
+
     def _handle_stop(
         self,
         frame: HostStopRunnerFrame,
@@ -1225,20 +1293,12 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
-        handle = self._runners.pop(frame.runner_id, None)
-        if handle is None:
+        if not self._terminate_runner(frame.runner_id):
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        if handle.proc.poll() is None:
-            handle.proc.terminate()
-            try:
-                handle.proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                handle.proc.kill()
-                handle.proc.wait()
         _logger.info("Stopped runner %s", frame.runner_id)
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
@@ -1280,7 +1340,11 @@ class HostProcess:
             status=status,
         )
 
-    async def _watch_runner(self, runner_id: str) -> None:
+    async def _watch_runner(
+        self,
+        runner_id: str,
+        handle: _RunnerHandle | None = None,
+    ) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
         Polls the runner subprocess until it exits. An exit while the
@@ -1298,7 +1362,7 @@ class HostProcess:
         :returns: None. Returns silently for intentional stops and clean
             (exit-code-0) shutdowns.
         """
-        handle = self._runners.get(runner_id)
+        handle = handle or self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
             return
         while handle.proc.poll() is None:
@@ -2124,6 +2188,8 @@ class HostProcess:
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 self._reaper_task = None
+            if self._termination_tasks:
+                await asyncio.gather(*self._termination_tasks, return_exceptions=True)
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
@@ -2138,12 +2204,8 @@ class HostProcess:
         for runner_id, handle in self._runners.items():
             if handle.proc.poll() is None:
                 _logger.info("Terminating runner %s on shutdown", runner_id)
-                handle.proc.terminate()
         for handle in self._runners.values():
-            try:
-                handle.proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                handle.proc.kill()
+            self._terminate_runner_process(handle)
         self._runners.clear()
 
     async def _connect_and_serve(self) -> None:
