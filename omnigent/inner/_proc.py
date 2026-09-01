@@ -12,6 +12,8 @@ equivalents:
 * :func:`terminate_tree` / :func:`kill_tree` — recursively stop a process and
   all of its descendants, using the process-group fast path on POSIX and
   :mod:`psutil` walking on every platform.
+* :func:`install_child_subreaper` — keep detached Linux descendants attached
+  to the nearest owning supervisor so tree teardown can still find them.
 * :func:`process_alive` — liveness check that doesn't rely on ``os.kill(pid, 0)``.
 
 :mod:`psutil` is already a core dependency, so the descendant walk needs no new
@@ -24,6 +26,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 from contextlib import suppress
 from typing import Protocol
@@ -39,6 +42,28 @@ logger = logging.getLogger(__name__)
 _killpg_fn = getattr(os, "killpg", None)
 _getpgid_fn = getattr(os, "getpgid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def install_child_subreaper() -> bool:
+    """Keep orphaned Linux descendants attached to this supervisor process.
+
+    ``prctl(PR_SET_CHILD_SUBREAPER, 1)`` makes this process the reparenting
+    target for descendants whose immediate parent exits. This lets a runner
+    retain detached tool daemons in its process tree so normal tree teardown
+    can terminate them. On unsupported platforms the call is a safe no-op.
+
+    :returns: ``True`` if the subreaper bit was set, otherwise ``False``.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        pr_set_child_subreaper = 36
+        return libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
 
 
 class _ProcessLike(Protocol):
@@ -119,6 +144,55 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         procs.extend(root.children(recursive=True))
     return procs
+
+
+def reap_exited_children(*, exclude_pids: set[int] | None = None) -> int:
+    """Reap exited direct children except explicitly owned process handles.
+
+    Intended for a Linux child-subreaper supervisor. ``WNOWAIT`` lets the
+    caller leave an owned worker's status for its :class:`subprocess.Popen`
+    while consuming only adopted orphan statuses.
+
+    :param exclude_pids: Child PIDs whose exit status another owner must reap.
+    :returns: Number of adopted child statuses consumed.
+    """
+    if sys.platform != "linux" or not hasattr(os, "waitid"):
+        return 0
+    excluded = exclude_pids or set()
+    reaped = 0
+    while True:
+        try:
+            info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except (ChildProcessError, OSError):
+            break
+        if info is None:
+            break
+        pid = info.si_pid
+        if pid in excluded:
+            break
+        try:
+            os.waitpid(pid, 0)
+            reaped += 1
+        except ChildProcessError:
+            break
+    return reaped
+
+
+def terminate_descendants(pid: int, *, grace: float = 0.0) -> None:
+    """Terminate every live descendant of ``pid`` without signalling ``pid``."""
+    try:
+        descendants = psutil.Process(pid).children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return
+    for proc in reversed(descendants):
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            proc.terminate()
+    if grace:
+        survivors = _wait_alive(descendants, grace)
+        for proc in survivors:
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                proc.kill()
+        _wait_alive(survivors, min(grace, 1.0))
 
 
 def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:

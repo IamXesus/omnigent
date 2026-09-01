@@ -1426,16 +1426,16 @@ def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> N
 
 
 def test_install_child_subreaper_is_safe_to_call() -> None:
-    """``_install_child_subreaper`` never raises and reports a bool.
+    """``install_child_subreaper`` never raises and reports a bool.
 
     ``True`` on Linux where ``prctl`` set the bit; ``False`` on non-Linux or
     when ``prctl`` is unavailable — both are acceptable, non-fatal outcomes.
     """
     import sys
 
-    from omnigent.host.connect import _install_child_subreaper
+    from omnigent.inner import _proc
 
-    result = _install_child_subreaper()
+    result = _proc.install_child_subreaper()
     assert isinstance(result, bool)
     if sys.platform != "linux":
         assert result is False

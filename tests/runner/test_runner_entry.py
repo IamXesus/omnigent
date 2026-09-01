@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import signal
+import subprocess
 import sys
 import tarfile
 import time
@@ -15,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import psutil
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _agent_cache_dest,
@@ -1760,6 +1763,302 @@ def test_main_configures_runner_process_logging(
     main()
 
     assert captured == {"destination": "runner", "force": True}
+
+
+def test_linux_supervisor_installs_subreaper_before_spawning_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Containment must be active before the real runner can launch tools."""
+    import omnigent.runner._entry as entry_mod
+
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        entry_mod._proc,
+        "install_child_subreaper",
+        lambda: events.append("subreaper") or True,
+    )
+    monkeypatch.setattr(entry_mod._proc, "terminate_descendants", lambda *a, **k: None)
+    monkeypatch.setattr(entry_mod._proc, "reap_exited_children", lambda **k: 0)
+
+    class _ExitedWorker:
+        pid = 12345
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    def _spawn(*args: object, **kwargs: object) -> _ExitedWorker:
+        del args, kwargs
+        events.append("spawn")
+        return _ExitedWorker()
+
+    monkeypatch.setattr(entry_mod.subprocess, "Popen", _spawn)
+
+    assert entry_mod._supervise_linux_process(["worker"], {}) == 0
+    assert events == ["subreaper", "spawn"]
+
+
+def test_main_routes_host_launched_linux_runner_through_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-launched Linux entrypoint must not run the tunnel unsupervised."""
+    import omnigent.runner._entry as entry_mod
+
+    events: list[str] = []
+    monkeypatch.setattr(entry_mod.sys, "platform", "linux")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PARENT_PID", str(os.getpid()))
+    monkeypatch.delenv(entry_mod._RUNNER_SUPERVISED_WORKER_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        entry_mod,
+        "_run_linux_runner_supervisor",
+        lambda parent_pid: events.append(f"supervisor:{parent_pid}") or 0,
+    )
+    monkeypatch.setattr(
+        entry_mod,
+        "_run_worker_main",
+        lambda: events.append("worker"),
+    )
+
+    main()
+
+    assert events == [f"supervisor:{os.getpid()}"]
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="adopt signal unavailable")
+def test_linux_supervisor_adoption_wins_parent_death_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI adoption during a parent check must not also stop the worker."""
+    import omnigent.runner._entry as entry_mod
+    from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
+
+    assert RUNNER_ADOPT_SIGNAL is not None
+    handlers: dict[int, Any] = {}
+    forwarded: list[int] = []
+
+    class _Worker:
+        pid = 12345
+        alive = True
+
+        def poll(self) -> int | None:
+            return None if self.alive else 0
+
+        def send_signal(self, signum: int) -> None:
+            forwarded.append(signum)
+
+    worker = _Worker()
+
+    def _capture_handler(signum: int, handler: Any) -> None:
+        if callable(handler):
+            handlers[signum] = handler
+
+    def _finish_worker(_seconds: float) -> None:
+        worker.alive = False
+
+    def _adopt_during_parent_check(_parent_pid: int) -> bool:
+        handlers[RUNNER_ADOPT_SIGNAL](RUNNER_ADOPT_SIGNAL, None)
+        return True
+
+    monkeypatch.setattr(entry_mod._proc, "install_child_subreaper", lambda: True)
+    monkeypatch.setattr(entry_mod._proc, "terminate_descendants", lambda *a, **k: None)
+    monkeypatch.setattr(entry_mod._proc, "reap_exited_children", lambda **k: 0)
+    monkeypatch.setattr(entry_mod.subprocess, "Popen", lambda *a, **k: worker)
+    monkeypatch.setattr(entry_mod.signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(entry_mod.signal, "signal", _capture_handler)
+    monkeypatch.setattr(entry_mod, "_parent_is_orphaned", _adopt_during_parent_check)
+    monkeypatch.setattr(entry_mod.time, "sleep", _finish_worker)
+
+    assert entry_mod._supervise_linux_process(["worker"], {}, parent_pid=999) == 0
+    assert forwarded == [RUNNER_ADOPT_SIGNAL]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux child-subreaper required")
+@pytest.mark.parametrize("worker_exit_code", [0, 7])
+def test_linux_supervisor_cleans_detached_daemon_on_worker_exit(
+    tmp_path: Path,
+    worker_exit_code: int,
+) -> None:
+    """Clean and failed worker exits both tear down adopted live daemons."""
+    daemon_pid_path = tmp_path / f"daemon-{worker_exit_code}.pid"
+    launcher_script = (
+        "import pathlib, subprocess, sys; "
+        "daemon = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)'], start_new_session=True); "
+        "pathlib.Path(sys.argv[1]).write_text(str(daemon.pid))"
+    )
+    worker_script = (
+        "import subprocess, sys; "
+        f"launcher = subprocess.Popen([sys.executable, '-c', {launcher_script!r}, "
+        f"{str(daemon_pid_path)!r}], start_new_session=True); "
+        f"launcher.wait(); raise SystemExit({worker_exit_code})"
+    )
+    supervisor_script = (
+        "import os, sys; "
+        "from omnigent.runner._entry import _supervise_linux_process; "
+        f"code = _supervise_linux_process([sys.executable, '-c', {worker_script!r}], "
+        "os.environ.copy()); "
+        "raise SystemExit(99 if code is None else code)"
+    )
+    supervisor = subprocess.Popen(
+        [sys.executable, "-c", supervisor_script],
+        **_proc.spawn_kwargs(),
+    )
+    daemon_pid: int | None = None
+    try:
+        supervisor.wait(timeout=10.0)
+        assert supervisor.returncode == worker_exit_code
+        assert daemon_pid_path.exists(), "detached daemon did not start"
+        daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+        assert not psutil.pid_exists(daemon_pid)
+    finally:
+        if daemon_pid is not None and psutil.pid_exists(daemon_pid):
+            psutil.Process(daemon_pid).kill()
+        if supervisor.poll() is None:
+            supervisor.kill()
+        supervisor.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux child-subreaper required")
+def test_linux_supervisor_reaps_exited_daemon_while_worker_stays_alive(
+    tmp_path: Path,
+) -> None:
+    """A long-lived worker must not accumulate adopted zombie processes."""
+    daemon_pid_path = tmp_path / "short-daemon.pid"
+    launcher_script = (
+        "import pathlib, subprocess, sys; "
+        "daemon = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(0.2)'], start_new_session=True); "
+        "pathlib.Path(sys.argv[1]).write_text(str(daemon.pid))"
+    )
+    worker_script = (
+        "import subprocess, sys, time; "
+        f"launcher = subprocess.Popen([sys.executable, '-c', {launcher_script!r}, "
+        f"{str(daemon_pid_path)!r}], start_new_session=True); "
+        "launcher.wait(); time.sleep(2)"
+    )
+    supervisor_script = (
+        "import os, sys; "
+        "from omnigent.runner._entry import _supervise_linux_process; "
+        f"code = _supervise_linux_process([sys.executable, '-c', {worker_script!r}], "
+        "os.environ.copy()); "
+        "raise SystemExit(99 if code is None else code)"
+    )
+    supervisor = subprocess.Popen(
+        [sys.executable, "-c", supervisor_script],
+        **_proc.spawn_kwargs(),
+    )
+    daemon_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while not daemon_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert daemon_pid_path.exists(), "short-lived daemon did not start"
+        daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+        time.sleep(0.8)
+        assert supervisor.poll() is None, "worker exited before the zombie check"
+        assert not psutil.pid_exists(daemon_pid), "adopted daemon remained as a zombie"
+        supervisor.wait(timeout=5.0)
+        assert supervisor.returncode == 0
+    finally:
+        if daemon_pid is not None and psutil.pid_exists(daemon_pid):
+            psutil.Process(daemon_pid).kill()
+        if supervisor.poll() is None:
+            supervisor.kill()
+        supervisor.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux child-subreaper required")
+def test_linux_supervisor_stops_runner_tree_when_original_parent_dies(
+    tmp_path: Path,
+) -> None:
+    """The supervisor preserves the existing host/CLI parent-death contract."""
+    supervisor_pid_path = tmp_path / "supervisor.pid"
+    daemon_pid_path = tmp_path / "parent-death-daemon.pid"
+    launcher_script = (
+        "import pathlib, subprocess, sys; "
+        "daemon = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)'], start_new_session=True); "
+        "pathlib.Path(sys.argv[1]).write_text(str(daemon.pid))"
+    )
+    worker_script = (
+        "import subprocess, sys, time; "
+        f"launcher = subprocess.Popen([sys.executable, '-c', {launcher_script!r}, "
+        f"{str(daemon_pid_path)!r}], start_new_session=True); "
+        "launcher.wait(); time.sleep(60)"
+    )
+    supervisor_script = (
+        "import os, sys; "
+        "from omnigent.runner._entry import (_exit_with_worker_returncode, "
+        "_supervise_linux_process); "
+        f"code = _supervise_linux_process([sys.executable, '-c', {worker_script!r}], "
+        "os.environ.copy(), parent_pid=int(sys.argv[1])); "
+        "_exit_with_worker_returncode(99 if code is None else code)"
+    )
+    parent_script = (
+        "import os, pathlib, subprocess, sys, time; "
+        f"supervisor = subprocess.Popen([sys.executable, '-c', {supervisor_script!r}, "
+        "str(os.getpid())], start_new_session=True); "
+        f"pathlib.Path({str(supervisor_pid_path)!r}).write_text(str(supervisor.pid)); "
+        f"daemon_path = pathlib.Path({str(daemon_pid_path)!r}); "
+        "deadline = time.monotonic() + 5; "
+        "\nwhile not daemon_path.exists() and time.monotonic() < deadline: time.sleep(0.05)"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", parent_script])
+    supervisor_pid: int | None = None
+    daemon_pid: int | None = None
+    try:
+        parent.wait(timeout=10.0)
+        assert parent.returncode == 0
+        assert supervisor_pid_path.exists(), "supervisor did not start"
+        assert daemon_pid_path.exists(), "detached daemon did not start"
+        supervisor_pid = int(supervisor_pid_path.read_text(encoding="utf-8"))
+        daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and (
+            _proc.process_alive(supervisor_pid) or _proc.process_alive(daemon_pid)
+        ):
+            time.sleep(0.05)
+        assert not _proc.process_alive(supervisor_pid)
+        assert not _proc.process_alive(daemon_pid)
+        try:
+            if psutil.Process(supervisor_pid).ppid() == os.getpid():
+                os.waitpid(supervisor_pid, os.WNOHANG)
+        except (ChildProcessError, psutil.NoSuchProcess):
+            pass
+    finally:
+        for pid in (daemon_pid, supervisor_pid):
+            if pid is not None and _proc.process_alive(pid):
+                psutil.Process(pid).kill()
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="POSIX signal status required")
+def test_linux_supervisor_preserves_worker_signal_exit_status() -> None:
+    """A signalled worker remains signalled at the host-facing PID boundary."""
+    worker_script = "import os, signal; os.kill(os.getpid(), signal.SIGSEGV)"
+    supervisor_script = (
+        "import os, sys; "
+        "from omnigent.runner._entry import (_exit_with_worker_returncode, "
+        "_supervise_linux_process); "
+        f"code = _supervise_linux_process([sys.executable, '-c', {worker_script!r}], "
+        "os.environ.copy()); "
+        "_exit_with_worker_returncode(99 if code is None else code)"
+    )
+    supervisor = subprocess.Popen(
+        [sys.executable, "-c", supervisor_script],
+        **_proc.spawn_kwargs(),
+    )
+    try:
+        supervisor.wait(timeout=10.0)
+        assert supervisor.returncode == -signal.SIGSEGV
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+        supervisor.wait(timeout=5.0)
 
 
 def test_main_preserves_unexpected_runtime_errors(

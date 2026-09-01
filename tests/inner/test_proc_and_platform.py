@@ -29,6 +29,59 @@ def _spin_cmd() -> list[str]:
     return ["sleep", "30"]
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux child-subreaper required")
+def test_subreaper_keeps_detached_daemon_in_terminable_runner_tree(
+    tmp_path: Path,
+) -> None:
+    """A detached tool daemon remains owned by and dies with its runner."""
+    daemon_pid_path = tmp_path / "daemon.pid"
+    launcher_script = (
+        "import pathlib, subprocess, sys; "
+        "daemon = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)'], start_new_session=True); "
+        "pathlib.Path(sys.argv[1]).write_text(str(daemon.pid))"
+    )
+    runner_script = (
+        "import subprocess, sys, time; "
+        "from omnigent.inner import _proc; "
+        "assert _proc.install_child_subreaper(); "
+        f"launcher = subprocess.Popen([sys.executable, '-c', {launcher_script!r}, "
+        f"{str(daemon_pid_path)!r}], start_new_session=True); "
+        "launcher.wait(); time.sleep(60)"
+    )
+    runner = subprocess.Popen(
+        [sys.executable, "-c", runner_script],
+        **_proc.spawn_kwargs(),
+    )
+    daemon_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while not daemon_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert daemon_pid_path.exists(), "detached daemon did not start"
+        daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                if psutil.Process(daemon_pid).ppid() == runner.pid:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.05)
+        assert psutil.Process(daemon_pid).ppid() == runner.pid
+
+        _proc.terminate_tree(runner, grace=2.0)
+        runner.wait(timeout=5.0)
+        assert not _proc.process_alive(daemon_pid)
+    finally:
+        if daemon_pid is not None and _proc.process_alive(daemon_pid):
+            psutil.Process(daemon_pid).kill()
+        if runner.poll() is None:
+            runner.kill()
+        runner.wait(timeout=5.0)
+
+
 # --------------------------------------------------------------------------
 # _platform
 # --------------------------------------------------------------------------

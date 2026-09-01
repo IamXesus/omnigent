@@ -13,12 +13,13 @@ import contextlib
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from fastapi import FastAPI
@@ -40,6 +41,10 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
+_RUNNER_SUPERVISED_WORKER_ENV_VAR = "_OMNIGENT_RUNNER_SUPERVISED_WORKER"
+_RUNNER_SUPERVISOR_POLL_INTERVAL_S = 0.1
+_RUNNER_SUPERVISOR_SHUTDOWN_GRACE_S = 20.0
+_RUNNER_SUPERVISOR_PARENT_DEATH_GRACE_S = 2.0
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 # Backstop on how long a graceful (idle-reaper) shutdown waits for the tunnel
@@ -1485,8 +1490,8 @@ def _install_crash_logging() -> None:
     sys.excepthook = _log_uncaught
 
 
-def main() -> None:
-    """Console entry point for the runner tunnel process.
+def _run_worker_main() -> None:
+    """Run the tunnel worker inside its process supervisor when configured.
 
     :returns: None.
     """
@@ -1504,6 +1509,119 @@ def main() -> None:
         _logger.error("runner exiting: %s", exc)
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
+
+
+def _supervise_linux_process(
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    parent_pid: int | None = None,
+) -> int | None:
+    """Run one worker under a Linux subreaper and contain its detached tools.
+
+    :param argv: Worker command, e.g. ``[python, "-m", "omnigent.runner._entry"]``.
+    :param env: Worker environment.
+    :param parent_pid: Original host/CLI PID whose lifetime owns this runner.
+    :returns: Worker exit code, or ``None`` when subreaper setup is unavailable.
+    """
+    if not _proc.install_child_subreaper():
+        return None
+
+    worker = subprocess.Popen(argv, env=env)
+    shutdown_deadline: float | None = None
+    adopted = False
+    previous_handlers: dict[int, Any] = {}
+
+    def _forward_shutdown(signum: int, _frame: object) -> None:
+        nonlocal shutdown_deadline
+        if shutdown_deadline is None:
+            shutdown_deadline = time.monotonic() + _RUNNER_SUPERVISOR_SHUTDOWN_GRACE_S
+        if worker.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                worker.send_signal(signum)
+
+    def _forward_adoption(signum: int, _frame: object) -> None:
+        nonlocal adopted
+        adopted = True
+        if worker.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                worker.send_signal(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _forward_shutdown)
+    from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
+
+    if RUNNER_ADOPT_SIGNAL is not None:
+        previous_handlers[RUNNER_ADOPT_SIGNAL] = signal.getsignal(RUNNER_ADOPT_SIGNAL)
+        signal.signal(RUNNER_ADOPT_SIGNAL, _forward_adoption)
+
+    try:
+        while True:
+            returncode = worker.poll()
+            if returncode is not None:
+                return returncode
+            _proc.reap_exited_children(exclude_pids={worker.pid})
+            if (
+                parent_pid is not None
+                and not adopted
+                and shutdown_deadline is None
+                and _parent_is_orphaned(parent_pid)
+                and not adopted
+            ):
+                shutdown_deadline = time.monotonic() + _RUNNER_SUPERVISOR_PARENT_DEATH_GRACE_S
+                with contextlib.suppress(ProcessLookupError):
+                    worker.send_signal(signal.SIGTERM)
+            if shutdown_deadline is not None and time.monotonic() >= shutdown_deadline:
+                _proc.terminate_descendants(os.getpid(), grace=5.0)
+            time.sleep(_RUNNER_SUPERVISOR_POLL_INTERVAL_S)
+    finally:
+        _proc.terminate_descendants(os.getpid(), grace=5.0)
+        if worker.poll() is None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                worker.wait(timeout=5.0)
+        _proc.reap_exited_children()
+        for sig, previous in previous_handlers.items():
+            signal.signal(sig, previous)
+
+
+def _run_linux_runner_supervisor(parent_pid: int) -> int | None:
+    """Start the real runner worker beneath a Linux process supervisor."""
+    from omnigent.runner.identity import RUNNER_PARENT_PID_ENV_VAR
+
+    worker_env = os.environ.copy()
+    worker_env[_RUNNER_SUPERVISED_WORKER_ENV_VAR] = "1"
+    worker_env[RUNNER_PARENT_PID_ENV_VAR] = str(os.getpid())
+    return _supervise_linux_process(
+        [sys.executable, "-m", "omnigent.runner._entry"],
+        worker_env,
+        parent_pid=parent_pid,
+    )
+
+
+def _exit_with_worker_returncode(returncode: int) -> None:
+    """Exit this supervisor with the worker's code or terminating signal."""
+    if returncode >= 0:
+        if returncode:
+            raise SystemExit(returncode)
+        return
+    signum = -returncode
+    with contextlib.suppress(OSError):
+        signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+    raise SystemExit(128 + signum)
+
+
+def main() -> None:
+    """Console entry point for the supervised runner tunnel process."""
+    supervised_worker = os.environ.pop(_RUNNER_SUPERVISED_WORKER_ENV_VAR, "") == "1"
+    parent_pid = _runner_parent_pid_from_env()
+    if sys.platform == "linux" and parent_pid is not None and not supervised_worker:
+        returncode = _run_linux_runner_supervisor(parent_pid)
+        if returncode is not None:
+            _exit_with_worker_returncode(returncode)
+            return
+    _run_worker_main()
 
 
 if __name__ == "__main__":

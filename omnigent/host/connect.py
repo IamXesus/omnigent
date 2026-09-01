@@ -180,44 +180,14 @@ _LOG_TAIL_MAX_LINES = 15
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
 # Cadence of the orphan-reaper sweep. The host installs itself as a child
-# subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
+# subreaper (Linux — see :func:`omnigent.inner._proc.install_child_subreaper`),
+# so a harness's
 # detached tool subprocess (node/npm/chromium/tmux/python) whose runner
 # parent died reparents to the host. With no reaper such an orphan lingers
 # as a ``<defunct>`` zombie; over an overnight blocked run they reached
 # ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
 # syscall, so 2s keeps zombie lifetime short at negligible cost.
 _ORPHAN_REAP_INTERVAL_S = 2.0
-
-
-def _install_child_subreaper() -> bool:
-    """Make this process reap orphaned descendants (Linux only).
-
-    ``prctl(PR_SET_CHILD_SUBREAPER, 1)`` asks the kernel to reparent any
-    orphaned descendant — e.g. a harness's detached tool subprocess whose
-    runner parent exited — to THIS process instead of PID 1, so the host's
-    orphan reaper can ``wait()`` on it even when the host is not itself
-    PID 1 (e.g. ``omni host --server`` launched under a shell). When the
-    host already IS PID 1 (container entrypoint) orphans reparent here
-    regardless and this call is a harmless no-op.
-
-    Complements — does not replace — the per-runner ``_watch_runner``
-    reaping of the host's own direct children.
-
-    :returns: ``True`` if the subreaper bit was set; ``False`` on non-Linux
-        or if ``prctl`` is unavailable. Both are non-fatal: direct-child
-        reaping and the PID-1 case still work; only the non-PID-1 orphan
-        case degrades.
-    """
-    if sys.platform != "linux":
-        return False
-    try:
-        import ctypes
-
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        _PR_SET_CHILD_SUBREAPER = 36
-        return libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
-    except (OSError, AttributeError):
-        return False
 
 
 def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
@@ -763,7 +733,8 @@ class HostProcess:
         so when the runner that owns them dies, those grandchildren
         (``node`` / ``npm`` / ``chromium`` / ``tmux`` / ``python``) are
         orphaned and reparented to this host (it is PID 1 in a container, or
-        a child subreaper otherwise — see :func:`_install_child_subreaper`).
+        a child subreaper otherwise — see
+        :func:`omnigent.inner._proc.install_child_subreaper`).
         Nothing ``wait()``s them, so each becomes a permanent ``<defunct>``
         zombie; a blocked overnight run accumulated ~900 and OOM'd the box
         (#1782).
@@ -810,7 +781,8 @@ class HostProcess:
           ``_handle_stop``.
 
         This runs only when the host is PID 1 (container) or a child
-        subreaper (:func:`_install_child_subreaper`); otherwise no orphan
+        subreaper (:func:`omnigent.inner._proc.install_child_subreaper`);
+        otherwise no orphan
         ever reparents here and every sweep is a no-op.
 
         :returns: Count of orphan (non-runner) processes reaped this sweep.
@@ -2109,7 +2081,7 @@ class HostProcess:
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
         # OOM the box on a long-blocked run (#1782).
-        if _install_child_subreaper():
+        if _proc.install_child_subreaper():
             _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
